@@ -1,0 +1,11 @@
+name = "instabox-panel"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+KEEPALIVE_INTERVAL_MINUTES = "15"
+
+# API Key、账号 JSON、面板密码和 Redis 凭据均通过 wrangler secret put 设置。

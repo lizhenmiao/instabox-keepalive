@@ -1,0 +1,10 @@
+{
+  "name": "instabox-keepalive",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check worker.js"
+  },
+  "engines": { "node": ">=22" }
+}

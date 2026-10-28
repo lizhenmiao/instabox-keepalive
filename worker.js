@@ -2,13 +2,15 @@
  * InstaBox 机器管理面板 —— Cloudflare Worker 单文件版
  *
  * 功能：
- *   1. 可视化管理所有 InstaBox 机器（启动 / 暂停 / 唤醒 / 停止 / 删除 / 新建）
+ *   1. 可视化管理多个账号的 InstaBox 机器（启动 / 暂停 / 唤醒 / 停止 / 删除）
  *   2. 每台机器可独立开关「自动保活」
- *   3. Cron 定时通过 activity-leases 续期保活（租约 3600 秒，永不触发 30 分钟空闲暂停）
+ *   3. Cron 续期活动租约（3600 秒），尊重冷却期与机器运行限制
  *   4. 保活配置与最近 200 条日志存放在 Upstash Redis（REST 接口，纯 fetch 无依赖）
  *
  * 环境变量（在 Worker 设置中配置）：
  *   INSTABOX_API_KEY        InstaBox 的 API 密钥（ibk_ 开头）
+ *   INSTABOX_ACCOUNTS       其他账号的 JSON 数组：[{ id, name, apiKey }]
+ *   KEEPALIVE_INTERVAL_MINUTES 定时任务分钟步长，默认 15，须与 Cron 一致
  *   ADMIN_PASSWORD          面板登录密码
  *   UPSTASH_REDIS_REST_URL  Upstash Redis 的 REST 地址
  *   UPSTASH_REDIS_REST_TOKEN Upstash Redis 的 REST 令牌
@@ -24,6 +26,41 @@ const LOG_KEEP = 200;                // Redis 中保留的日志条数
 const REQUEST_TIMEOUT_MS = 55_000;   // 稍大于 wake/lease 接口的最长等待时间
 const KEY_RE = /^ibk_[A-Za-z0-9_-]+$/;
 const MACHINE_RE = /^m_[A-Za-z0-9_-]+$/;
+const ACCOUNT_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const PENDING_STATES = new Set(["creating", "starting", "stopping", "suspending", "resuming", "deleting"]);
+
+function getAccounts(env) {
+  const accounts = [];
+  if (env.INSTABOX_API_KEY) accounts.push({ id: "default", name: "默认账号", apiKey: env.INSTABOX_API_KEY });
+  if (env.INSTABOX_ACCOUNTS) {
+    let configured;
+    try { configured = JSON.parse(env.INSTABOX_ACCOUNTS); }
+    catch { throw new Error("INSTABOX_ACCOUNTS 必须是 JSON 数组"); }
+    if (!Array.isArray(configured)) throw new Error("INSTABOX_ACCOUNTS 必须是 JSON 数组");
+    accounts.push(...configured);
+  }
+  if (!accounts.length) throw new Error("请配置 INSTABOX_API_KEY 或 INSTABOX_ACCOUNTS");
+  const ids = new Set(), keys = new Set();
+  return accounts.map((account, index) => {
+    if (!account || typeof account.id !== "string" || !ACCOUNT_RE.test(account.id) || typeof account.apiKey !== "string" || !KEY_RE.test(account.apiKey)) {
+      throw new Error("第 " + (index + 1) + " 个账号的 id 或 apiKey 无效");
+    }
+    if (ids.has(account.id) || keys.has(account.apiKey)) throw new Error("账号 ID 或 API Key 重复，请检查配置");
+    if (account.name != null && (typeof account.name !== "string" || account.name.length > 80)) throw new Error("账号名称须为不超过 80 字的文本");
+    ids.add(account.id); keys.add(account.apiKey);
+    return { id: account.id, name: account.name || account.id, apiKey: account.apiKey };
+  });
+}
+
+function intervalMinutes(env) {
+  const value = Number(env.KEEPALIVE_INTERVAL_MINUTES || 15);
+  if (!Number.isInteger(value) || value < 1 || value > 30) throw new Error("KEEPALIVE_INTERVAL_MINUTES 须为 1–30 的整数");
+  return value;
+}
+
+function configKey(accountId, machineId) { return accountId + ":" + machineId; }
+
+function safeMessage(value) { return String(value || "").replace(/ibk_[A-Za-z0-9_-]+/g, "[已隐藏密钥]"); }
 
 // ---------- Upstash Redis（REST，pipeline 方式统一收发） ----------
 
@@ -71,24 +108,48 @@ function toHash(raw) {
   return out;
 }
 
-/** 读全部机器的保活配置：Hash field=machineId, value=JSON 字符串 */
+/** 旧 machineId 字段只归属 default；新 accountId:machineId 字段优先。 */
 async function loadConfigs(env) {
   const [raw] = await redis(env, [["HGETALL", REDIS_PREFIX + ":machines"]]);
   const out = {};
-  for (const [id, json] of Object.entries(toHash(raw))) {
-    try { out[id] = JSON.parse(json); } catch { /* 忽略坏数据 */ }
+  const entries = Object.entries(toHash(raw));
+  for (const [id, value] of entries.sort(([a], [b]) => Number(a.includes(":")) - Number(b.includes(":")))) {
+    const key = MACHINE_RE.test(id) ? configKey("default", id) : id;
+    const [accountId, machineId, extra] = key.split(":");
+    if (extra !== undefined || !ACCOUNT_RE.test(accountId) || !MACHINE_RE.test(machineId)) continue;
+    try {
+      const config = JSON.parse(value);
+      if (config && typeof config === "object" && !Array.isArray(config)) out[key] = config;
+    } catch { /* 忽略坏数据 */ }
   }
   return out;
 }
 
 /** 写入单台机器的保活配置 */
-function saveConfig(env, machineId, config) {
-  return redis(env, [["HSET", REDIS_PREFIX + ":machines", machineId, JSON.stringify(config)]]);
+function saveConfig(env, accountId, machineId, config) {
+  const commands = [["HSET", REDIS_PREFIX + ":machines", configKey(accountId, machineId), JSON.stringify(config)]];
+  if (accountId === "default") commands.push(["HDEL", REDIS_PREFIX + ":machines", machineId]);
+  return redis(env, commands);
 }
 
 /** 删除某台机器的保活配置（机器被删除时调用） */
-function dropConfig(env, machineId) {
-  return redis(env, [["HDEL", REDIS_PREFIX + ":machines", machineId]]);
+function dropConfig(env, accountId, machineId) {
+  const fields = [configKey(accountId, machineId)];
+  if (accountId === "default") fields.push(machineId);
+  return redis(env, [["HDEL", REDIS_PREFIX + ":machines", ...fields]]);
+}
+
+/** Cron 与手动操作共享每台机器的锁；故障时自动过期，释放时校验归属。 */
+async function withMachineLock(env, key, action) {
+  const lockKey = REDIS_PREFIX + ":lock:" + key;
+  const token = crypto.randomUUID();
+  const [acquired] = await redis(env, [["SET", lockKey, token, "NX", "EX", "600"]]);
+  if (acquired !== "OK") return { locked: true };
+  try { return await action(); }
+  finally {
+    await redis(env, [["EVAL", "if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end", "1", lockKey, token]])
+      .catch(() => console.warn("机器操作锁释放失败，将在到期后自动释放"));
+  }
 }
 
 /** 追加一条日志并裁剪到最近 LOG_KEEP 条 */
@@ -102,8 +163,8 @@ function addLog(env, entry) {
 // ---------- InstaBox API ----------
 
 /** 调用 InstaBox API；返回 { ok, status, data }，错误体自动解析出 code/message */
-async function ib(env, method, path, body, idempotencyKey) {
-  const headers = { "X-API-Key": env.INSTABOX_API_KEY, Accept: "application/json" };
+async function ib(env, account, method, path, body, idempotencyKey) {
+  const headers = { "X-API-Key": account.apiKey, Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   try {
@@ -119,7 +180,7 @@ async function ib(env, method, path, body, idempotencyKey) {
       status: res.status,
       data,
       code: data?.error?.code || null,
-      message: data?.error?.message || null,
+      message: safeMessage(data?.error?.message) || null,
     };
   } catch (e) {
     // 区分超时与连接失败，并带上底层错误码（如 ENOTFOUND=域名解析失败、ECONNRESET=连接被重置）
@@ -130,47 +191,99 @@ async function ib(env, method, path, body, idempotencyKey) {
   }
 }
 
-/**
- * 给一台机器续活动租约。
- * 返回 { state: "ok" | "starting" | "failed", detail }
- */
-async function renewLease(env, machineId) {
-  const leasePath = "/v1/machines/" + machineId + "/activity-leases/" + LEASE_ID;
-  const r = await ib(env, "PUT", leasePath, { ttlSeconds: LEASE_TTL_SECONDS });
-
-  if (r.ok) {
-    if (r.data?.machineId !== machineId || !r.data?.expiresAt) {
-      return { state: "failed", detail: "接口返回的租约信息异常" };
-    }
-    return { state: "ok", detail: "租约至 " + r.data.expiresAt, expiresAt: r.data.expiresAt };
-  }
-
-  // 机器处于 stopped（而非空闲暂停）时租约接口会拒绝，此时尝试重新启动
-  if (r.status === 409) {
-    const s = await ib(env, "POST", "/v1/machines/" + machineId + "/start", undefined, crypto.randomUUID());
-    if (s.ok) return { state: "starting", detail: "机器未运行，已下发启动指令" };
-    return { state: "failed", detail: "启动失败：HTTP " + s.status + (s.code ? " " + s.code : "") };
-  }
-
-  return { state: "failed", detail: "HTTP " + r.status + (r.code ? " " + r.code : "") };
+function failure(result, prefix) {
+  return { state: "failed", detail: prefix + "：" + (result.status ? "HTTP " + result.status : "网络错误") +
+    (result.code ? " " + safeMessage(result.code) : "") + (result.message ? " · " + result.message : "") };
 }
 
-/** 立即保活一台机器并把结果写入配置与日志（面板开关打开时也会调用一次） */
-async function keepAliveOnce(env, machineId, name) {
-  const configs = await loadConfigs(env);
-  const config = configs[machineId] || {};
-  const result = await renewLease(env, machineId);
+function machineGuard(machine) {
+  if (machine.cooldownUntil) {
+    const until = Date.parse(machine.cooldownUntil);
+    if (!Number.isFinite(until)) return { state: "failed", detail: "冷却截止时间无效，本轮未操作" };
+    if (until > Date.now()) return { state: "cooldown", detail: "冷却至 " + machine.cooldownUntil, cooldownUntil: machine.cooldownUntil };
+  }
+  if (PENDING_STATES.has(machine.state) || machine.operationId) return { state: "waiting", detail: "机器正在执行操作，等待下一轮确认" };
+  return null;
+}
+
+async function readMachine(env, account, machineId) {
+  const r = await ib(env, account, "GET", "/v1/machines/" + machineId);
+  if (!r.ok) return { error: failure(r, "读取机器状态失败") };
+  if (r.data?.id !== machineId || typeof r.data?.state !== "string") return { error: { state: "failed", detail: "机器状态响应无效，本轮未操作" } };
+  return { machine: r.data };
+}
+
+/** 冲突可能来自冷却或其他操作，重查状态，不把所有 409 都当作停止。 */
+async function conflictResult(env, account, machineId, response, prefix) {
+  if (response.status === 409) {
+    const fresh = await readMachine(env, account, machineId);
+    if (fresh.machine) {
+      const guarded = machineGuard(fresh.machine);
+      if (guarded) return guarded;
+    }
+  }
+  return failure(response, prefix);
+}
+
+async function renewLease(env, account, machineId) {
+  const initial = await readMachine(env, account, machineId);
+  if (initial.error) return initial.error;
+  const guarded = machineGuard(initial.machine);
+  if (guarded) return guarded;
+  let machine = initial.machine;
+  if (machine.state === "stopped" || machine.state === "suspended") {
+    const action = machine.state === "stopped" ? "start" : "resume";
+    const started = await ib(env, account, "POST", "/v1/machines/" + machineId + "/" + action, undefined, crypto.randomUUID());
+    if (!started.ok) return conflictResult(env, account, machineId, started, "恢复机器失败");
+    // 有限轮询：受理不等于运行，也不等于续租成功。未就绪时留给下一轮。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, 2000));
+      const fresh = await readMachine(env, account, machineId);
+      if (fresh.error) return fresh.error;
+      machine = fresh.machine;
+      const state = machineGuard(machine);
+      if (state && state.state !== "waiting") return state;
+      if (machine.state === "running" && !state) break;
+      if (attempt === 2) return { state: "waiting", detail: "恢复指令已受理，尚未确认运行；下轮重试" };
+    }
+  }
+  if (machine.state !== "running") return { state: "failed", detail: "机器状态为 " + machine.state + "，未自动启动" };
+  const r = await ib(env, account, "PUT", "/v1/machines/" + machineId + "/activity-leases/" + LEASE_ID, { ttlSeconds: LEASE_TTL_SECONDS });
+  if (!r.ok) return conflictResult(env, account, machineId, r, "续租失败");
+  if (r.data?.machineId !== machineId || !(Date.parse(r.data?.expiresAt) > Date.now())) {
+    return { state: "failed", detail: "接口返回的租约信息异常" };
+  }
+  return { state: "ok", detail: "租约至 " + r.data.expiresAt, expiresAt: r.data.expiresAt };
+}
+
+async function keepAliveOnce(env, account, machineId, config, action) {
+  const result = await renewLease(env, account, machineId);
   const now = new Date().toISOString();
-  await saveConfig(env, machineId, {
-    ...config,
-    keepalive: "on",
-    lastStatus: result.state,
-    lastDetail: result.detail,
-    leaseExpiresAt: result.expiresAt || null,
-    lastAt: now,
+  await saveConfig(env, account.id, machineId, {
+    ...config, lastStatus: result.state, lastDetail: result.detail,
+    // 一次失败不抹掉仍有效的旧租约；机器冷却／等待恢复时不再声称持有租约。
+    leaseExpiresAt: result.expiresAt || (result.state === "failed" ? config.leaseExpiresAt || null : null),
+    cooldownUntil: result.cooldownUntil || null, lastAt: now,
   });
-  await addLog(env, { t: now, machineId, name: name || machineId, action: "保活", ok: result.state !== "failed", detail: result.detail });
+  await addLog(env, { t: now, accountId: account.id, accountName: account.name, machineId,
+    name: config.name || machineId, action, ok: result.state !== "failed", detail: result.detail });
   return result;
+}
+
+/** 分页失败时保留已取得的机器，同时给界面明确提示；检测重复 cursor。 */
+async function listMachines(env, account) {
+  const machines = new Map(), cursors = new Set();
+  let cursor = null;
+  do {
+    const path = "/v1/machines" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : "");
+    const r = await ib(env, account, "GET", path);
+    if (!r.ok || !Array.isArray(r.data?.machines)) return { machines: [...machines.values()], error: failure(r, "获取机器列表失败").detail };
+    for (const machine of r.data.machines) if (machine && MACHINE_RE.test(machine.id)) machines.set(machine.id, machine);
+    cursor = r.data.nextCursor;
+    if (cursor && (typeof cursor !== "string" || cursors.has(cursor))) return { machines: [...machines.values()], error: "机器列表分页游标无效或重复" };
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return { machines: [...machines.values()], error: null };
 }
 
 // ---------- 鉴权与路由 ----------
@@ -201,139 +314,143 @@ async function handleApi(request, env, url) {
   if (!authorized(request, env)) return json({ error: "未登录或密码错误" }, 401);
   const path = url.pathname.replace(/^\/api/, "");
   const method = request.method;
-
-  // 登录校验
   if (path === "/auth" && method === "POST") return json({ ok: true });
 
-  // 机器列表：InstaBox 实时状态 + Redis 保活配置合并
-  // Redis 读取失败不影响机器列表展示，只把保活状态标为未知
-  if (path === "/machines" && method === "GET") {
-    const list = await ib(env, "GET", "/v1/machines");
-    if (!list.ok) return json({ error: "获取机器列表失败：" + (list.message || list.status) }, 502);
-    let configs = {};
-    let configError = null;
-    try {
-      configs = await loadConfigs(env);
-    } catch (e) {
-      configError = e.message;
-    }
-    const machines = (list.data?.machines || []).map((m) => ({
-      id: m.id,
-      name: m.name,
-      state: m.state,
-      spec: m.spec,
-      template: m.template?.id || null,
-      guestUser: m.guestUser || null,
-      autoSuspendAfterSeconds: m.autoSuspendAfterSeconds ?? null,
-      keepalive: configs[m.id] || null,
-    }));
-    return json({ machines, configError });
-  }
-
-  // 机器生命周期操作与删除
-  const lifecycleMatch = path.match(/^\/machines\/([^/]+)\/(start|stop|suspend|resume)$/);
-  if (lifecycleMatch && method === "POST") {
-    const [, id, action] = lifecycleMatch;
-    if (!MACHINE_RE.test(id) && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(id)) return json({ error: "机器 ID 不合法" }, 400);
-    const input = await request.json().catch(() => ({}));
-    const label = typeof input.name === "string" && input.name ? input.name : id;
-    const ACTION_LABEL = { start: "启动", stop: "停止", suspend: "暂停", resume: "唤醒" };
-    const r = await ib(env, "POST", "/v1/machines/" + id + "/" + action, undefined, crypto.randomUUID());
-    if (!r.ok) {
-      await addLog(env, { t: new Date().toISOString(), machineId: id, name: label, action: ACTION_LABEL[action], ok: false, detail: "下发失败：" + (r.message || r.status) }).catch(() => {});
-      return json({ error: (action + " 失败：") + (r.message || r.status) }, 502);
-    }
-    // 记录实际下发的动作，便于事后核对是暂停还是停止
-    await addLog(env, { t: new Date().toISOString(), machineId: id, name: label, action: ACTION_LABEL[action], ok: true, detail: "指令已下发（" + action + "）" }).catch(() => {});
-    // 手动停止/暂停时自动关掉保活，避免下一轮 Cron 又把机器拉起来
-    if (action === "stop" || action === "suspend") {
-      const configs = await loadConfigs(env);
-      if (configs[id]?.keepalive === "on") {
-        await saveConfig(env, id, { ...configs[id], keepalive: "off", lastDetail: "手动" + ACTION_LABEL[action] + "，保活已关闭" });
-        await addLog(env, { t: new Date().toISOString(), machineId: id, name: label, action: "保活", ok: true, detail: "手动" + ACTION_LABEL[action] + "，自动关闭保活" });
-      }
-    }
-    return json({ ok: true, operationId: r.data?.operationId || r.data?.id || null }, 202);
-  }
-
-  const deleteMatch = path.match(/^\/machines\/([^/]+)$/);
-  if (deleteMatch && method === "DELETE") {
-    const id = deleteMatch[1];
-    const r = await ib(env, "DELETE", "/v1/machines/" + id);
-    if (!r.ok) return json({ error: "删除失败：" + (r.message || r.status) }, 502);
-    await dropConfig(env, id).catch(() => {});
-    await addLog(env, { t: new Date().toISOString(), machineId: id, name: id, action: "删除", ok: true, detail: "机器已删除，保活配置已清理" });
-    return json({ ok: true, operationId: r.data?.operationId || r.data?.id || null }, 202);
-  }
-
-  // 保活开关：打开时立即续一次租约，关闭时仅写配置
-  const keepaliveMatch = path.match(/^\/machines\/([^/]+)\/keepalive$/);
-  if (keepaliveMatch && method === "POST") {
-    const id = keepaliveMatch[1];
-    const input = await request.json().catch(() => ({}));
-    const enable = !!input.enable;
-    const configs = await loadConfigs(env);
-    const config = configs[id] || {};
-    if (enable) {
-      // 保活配置在续期之前就已写入，因此首次续期失败也算「已开启」，
-      // 由定时任务继续重试，这里只把失败原因作为警告返回，避免前端把开关回滚掉
-      const result = await keepAliveOnce(env, id, input.name);
-      const warning = result.state === "failed"
-        ? "保活已开启，但首次续期失败：" + result.detail + "（定时任务会继续重试）"
-        : null;
-      return json({ ok: true, detail: result.detail, warning });
-    }
-    await saveConfig(env, id, { ...config, keepalive: "off", lastDetail: "保活已手动关闭", lastAt: new Date().toISOString() });
-    await addLog(env, { t: new Date().toISOString(), machineId: id, name: input.name || id, action: "保活", ok: true, detail: "保活已关闭" });
-    return json({ ok: true });
-  }
-
-  // 日志
   if (path === "/logs" && method === "GET") {
     const [logs] = await redis(env, [["LRANGE", REDIS_PREFIX + ":logs", "0", "49"]]);
     return json({ logs: (logs || []).map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean) });
   }
-  // 清空日志：只删日志，不动保活配置
   if (path === "/logs" && method === "DELETE") {
     await redis(env, [["DEL", REDIS_PREFIX + ":logs"]]);
     return json({ ok: true });
   }
 
-  // 配额
-  if (path === "/usage" && method === "GET") {
-    const r = await ib(env, "GET", "/v1/usage");
-    return json({ usage: r.ok ? r.data : null });
+  const accounts = getAccounts(env);
+  if (path === "/machines" && method === "GET") {
+    let configs = {}, configError = null;
+    try { configs = await loadConfigs(env); }
+    catch (e) { configError = safeMessage(e.message); }
+    const lists = await Promise.all(accounts.map((account) => listMachines(env, account)));
+    const accountErrors = [];
+    const machines = accounts.flatMap((account, index) => {
+      const list = lists[index];
+      if (list.error) accountErrors.push({ accountId: account.id, accountName: account.name, error: list.error });
+      return list.machines.map((m) => ({
+        id: m.id, key: configKey(account.id, m.id), accountId: account.id, accountName: account.name,
+        name: m.name, state: m.state, spec: m.spec, template: m.template?.id || null,
+        guestUser: m.guestUser || null, autoSuspendAfterSeconds: m.autoSuspendAfterSeconds ?? null,
+        cooldownUntil: m.cooldownUntil || null, operationId: m.operationId || null,
+        keepalive: configs[configKey(account.id, m.id)] || null,
+      }));
+    });
+    return json({ machines, configError, accountErrors, accountCount: accounts.length, intervalMinutes: intervalMinutes(env) });
   }
 
-  return json({ error: "接口不存在" }, 404);
+  if (path === "/usage" && method === "GET") {
+    const results = await Promise.all(accounts.map((account) => ib(env, account, "GET", "/v1/usage")));
+    const usage = {}, accountErrors = [];
+    results.forEach((r, index) => {
+      if (!r.ok || !r.data) { accountErrors.push({ accountName: accounts[index].name, error: failure(r, "读取配额失败").detail }); return; }
+      for (const key of ["machines", "snapshots", "storageGiB"]) {
+        if (typeof r.data[key] === "number") usage[key] = (usage[key] || 0) + r.data[key];
+      }
+    });
+    return json({ usage, accountErrors });
+  }
+
+  // 兼容旧单账号接口；多账号接口显式携带账号 ID，不能回退到别的 Key。
+  const match = path.match(/^\/(?:accounts\/([^/]+)\/)?machines\/([^/]+)(?:\/(start|stop|suspend|resume|keepalive))?$/);
+  if (!match) return json({ error: "接口不存在" }, 404);
+  const [, requestedAccount, machineId, action] = match;
+  const account = accounts.find((a) => a.id === (requestedAccount || "default"));
+  if (!account) return json({ error: "账号未配置" }, 404);
+  if (!MACHINE_RE.test(machineId)) return json({ error: "机器 ID 不合法" }, 400);
+  if (!((method === "POST" && action) || (method === "DELETE" && !action))) return json({ error: "接口不存在" }, 404);
+  const input = method === "POST" ? await request.json().catch(() => ({})) : {};
+  if (action === "keepalive" && typeof input?.enable !== "boolean") return json({ error: "enable 必须是布尔值" }, 400);
+  const name = typeof input?.name === "string" && input.name ? input.name : machineId;
+  const key = configKey(account.id, machineId);
+  const result = await withMachineLock(env, key, async () => {
+    const configs = await loadConfigs(env);
+    const config = configs[key] || {};
+    const log = (label, ok, detail) => addLog(env, {
+      t: new Date().toISOString(), accountId: account.id, accountName: account.name,
+      machineId, name, action: label, ok, detail,
+    });
+
+    if (action === "keepalive") {
+      const updated = { ...config, name, keepalive: input.enable ? "on" : "off" };
+      if (input.enable) {
+        // 先保存开关，首次状态查询或续租失败时下一轮仍可重试。
+        await saveConfig(env, account.id, machineId, updated);
+        const renewed = await keepAliveOnce(env, account, machineId, updated, "保活");
+        return json({ ok: true, detail: renewed.detail, warning: renewed.state === "failed" ? "保活已开启，但本次失败：" + renewed.detail : null });
+      }
+      await saveConfig(env, account.id, machineId, { ...updated, lastDetail: "保活已手动关闭", lastAt: new Date().toISOString() });
+      await log("保活", true, "保活已关闭");
+      return json({ ok: true });
+    }
+
+    const labels = { start: "启动", stop: "停止", suspend: "暂停", resume: "唤醒" };
+    if (action === "start" || action === "resume") {
+      const current = await readMachine(env, account, machineId);
+      if (current.error) return json({ error: current.error.detail }, 502);
+      const guard = machineGuard(current.machine);
+      if (guard) return json({ error: guard.detail, cooldownUntil: guard.cooldownUntil || null }, 409);
+    }
+
+    // 在发出停止/暂停/删除前写入 off，持久化失败时不执行外部操作。
+    const disables = !action || action === "stop" || action === "suspend";
+    if (disables && config.keepalive === "on") {
+      await saveConfig(env, account.id, machineId, { ...config, keepalive: "off", lastDetail: "手动操作，保活已关闭" });
+    }
+    const endpoint = "/v1/machines/" + machineId + (action ? "/" + action : "");
+    const r = await ib(env, account, action ? "POST" : "DELETE", endpoint, undefined, action ? crypto.randomUUID() : undefined);
+    const label = action ? labels[action] : "删除";
+    if (!r.ok) {
+      // 网络超时可能已被服务端受理，保持 off，避免下轮又启动机器。
+      const detail = failure(r, label + "失败").detail + (disables && config.keepalive === "on" ? "；保活已关闭，请核对机器状态" : "");
+      await log(label, false, detail).catch(() => {});
+      return json({ error: detail }, 502);
+    }
+    if (!action) await dropConfig(env, account.id, machineId);
+    await log(label, true, "指令已下发（" + (action || "delete") + "）").catch(() => {});
+    return json({ ok: true, operationId: r.data?.operationId || r.data?.id || null }, 202);
+  });
+  return result.locked ? json({ error: "该机器正在执行其他操作，请稍后重试" }, 409) : result;
 }
 
 // ---------- Cron 保活任务 ----------
 
-/** 每 15 分钟执行：对所有开启保活的机器续租约，异常时尝试拉起 */
 async function runKeepaliveTick(env) {
-  if (!env.INSTABOX_API_KEY || !KEY_RE.test(env.INSTABOX_API_KEY)) throw new Error("未配置有效的 INSTABOX_API_KEY");
+  const accounts = new Map(getAccounts(env).map((account) => [account.id, account]));
   if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) throw new Error("未配置 Upstash Redis");
-
   const configs = await loadConfigs(env);
   const targets = Object.entries(configs).filter(([, c]) => c.keepalive === "on");
-  if (targets.length === 0) return { renewed: 0 };
-
-  let renewed = 0;
-  for (const [machineId, config] of targets) {
-    const result = await renewLease(env, machineId);
-    const now = new Date().toISOString();
-    await saveConfig(env, machineId, {
-      ...config,
-      lastStatus: result.state,
-      lastDetail: result.detail,
-      leaseExpiresAt: result.expiresAt || null,
-      lastAt: now,
-    });
-    await addLog(env, { t: now, machineId, name: config.name || machineId, action: "自动保活", ok: result.state !== "failed", detail: result.detail });
-    if (result.state !== "failed") renewed++;
+  const counts = { renewed: 0, cooldown: 0, waiting: 0, skipped: 0, failed: 0, total: targets.length };
+  for (const [key] of targets) {
+    const [accountId, machineId] = key.split(":");
+    const account = accounts.get(accountId);
+    if (!account) { counts.skipped++; continue; }
+    try {
+      const result = await withMachineLock(env, key, async () => {
+        // 重新读取，避免在本轮开始后用户关闭保活，而旧快照又把它打开。
+        const latest = (await loadConfigs(env))[key];
+        if (!latest || latest.keepalive !== "on") return { state: "skipped" };
+        return keepAliveOnce(env, account, machineId, latest, "自动保活");
+      });
+      if (result.locked || result.state === "skipped") counts.skipped++;
+      else if (result.state === "ok") counts.renewed++;
+      else if (result.state === "cooldown") counts.cooldown++;
+      else if (result.state === "waiting") counts.waiting++;
+      else counts.failed++;
+    } catch (e) {
+      counts.failed++;
+      await addLog(env, { t: new Date().toISOString(), accountId, accountName: account.name,
+        machineId, name: configs[key].name || machineId, action: "自动保活", ok: false, detail: safeMessage(e.message) }).catch(() => {});
+    }
   }
-  return { renewed, total: targets.length };
+  return counts;
 }
 
 // ---------- Worker 入口 ----------
@@ -349,16 +466,18 @@ export default {
       }
       return new Response("Not found", { status: 404 });
     } catch (e) {
-      return json({ error: "服务器内部错误：" + ((e && e.message) || e) }, 500);
+      return json({ error: "服务器内部错误：" + safeMessage((e && e.message) || e) }, 500);
     }
   },
 
   async scheduled(controller, env, ctx) {
     try {
+      const expectedCron = "*/" + intervalMinutes(env) + " * * * *";
+      if (controller.cron && controller.cron !== expectedCron) console.warn("Cron 与 KEEPALIVE_INTERVAL_MINUTES 不一致，页面预计时间可能不准确");
       const result = await runKeepaliveTick(env);
       console.log(JSON.stringify({ event: "keepalive_tick_ok", ...result }));
     } catch (error) {
-      console.error(JSON.stringify({ event: "keepalive_tick_failed", message: error.message }));
+      console.error(JSON.stringify({ event: "keepalive_tick_failed", message: safeMessage(error.message) }));
     }
   },
 };
@@ -366,7 +485,7 @@ export default {
 // ---------- 前端面板（单页 HTML，内嵌样式与脚本） ----------
 
 function renderPage() {
-  return `<!DOCTYPE html>
+  return String.raw`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -538,6 +657,7 @@ function renderPage() {
   }
   .keepalive .state { color: var(--muted); font-size: 11.5px; margin-top: 4px; line-height: 1.5; }
   .keepalive .state.active { color: #248a3d; }
+  .keepalive .state.failed { color: #c4281c; }
 
   .switch {
     width: 51px; height: 31px; border-radius: 16px; border: none; padding: 0;
@@ -705,7 +825,7 @@ function renderPage() {
 "use strict";
 
 var AUTH = localStorage.getItem("ib_auth") || "";
-var DATA = { machines: [], logs: [], usage: null };
+var DATA = { machines: [], logs: [], usage: null, accountCount: 1 };
 var BUSY = {};            // 防重复点击：按操作维度加锁
 var MACHINE_BUSY = {};    // 按机器加锁：一台机器操作中，卡片内所有按钮一并禁用
 var toastTimer = null;
@@ -732,7 +852,7 @@ function esc(s) {
 function delay(ms) {
   return new Promise(function (resolve) { setTimeout(resolve, ms); });
 }
-var CRON_MINUTES = 15;   // 与 wrangler.toml 里的定时任务间隔保持一致
+var CRON_MINUTES = 15;   // 从 /api/machines 读取，须与 Cloudflare Cron 一致
 
 /** 统一按中国时间（UTC+8）输出 xxxx-xx-xx xx:xx:xx，不受浏览器所在时区影响 */
 function fmtCN(iso) {
@@ -749,12 +869,15 @@ function fmtCN(iso) {
   return o.year + "-" + o.month + "-" + o.day + " " + o.hour + ":" + o.minute + ":" + o.second;
 }
 
-/** 下一次保活时间：按定时任务的整刻边界推算 */
-function nextTickAt(fromIso) {
-  var base = fromIso ? new Date(fromIso).getTime() : Date.now();
-  if (isNaN(base)) base = Date.now();
-  var step = CRON_MINUTES * 60 * 1000;
-  return new Date(Math.ceil(base / step) * step).toISOString();
+/** 按 Cron 的小时内分钟步长计算；*/
+function nextTickAt(notBefore) {
+  var boundary = Date.parse(notBefore);
+  var base = Math.max(Date.now() + 1, isNaN(boundary) ? 0 : boundary);
+  var next = new Date(base);
+  next.setUTCSeconds(0, 0);
+  if (next.getTime() < base) next.setUTCMinutes(next.getUTCMinutes() + 1);
+  while (next.getUTCMinutes() % CRON_MINUTES !== 0) next.setUTCMinutes(next.getUTCMinutes() + 1);
+  return next.toISOString();
 }
 
 function remainText(iso) {
@@ -833,7 +956,7 @@ function setMachineLocked(id, locked) {
   if (!card) return;
   card.classList.toggle("locked", locked);
   var els = card.querySelectorAll("button");
-  for (var i = 0; i < els.length; i++) els[i].disabled = locked;
+  for (var i = 0; i < els.length; i++) els[i].disabled = locked || els[i].hasAttribute("data-unavailable");
 }
 
 /** 按钮忙碌态：锁定宽度避免跳动，显示转圈，结束后恢复原文案 */
@@ -925,13 +1048,19 @@ function loadAll() {
 
     if (results[0].status === "fulfilled") {
       DATA.machines = results[0].value.machines || [];
+      DATA.accountCount = results[0].value.accountCount || 1;
+      CRON_MINUTES = results[0].value.intervalMinutes || 15;
+      (results[0].value.accountErrors || []).forEach(function (item) { problems.push(item.accountName + "：" + item.error); });
       if (results[0].value.configError) problems.push("保活配置读取失败：" + results[0].value.configError);
     } else {
       problems.push(results[0].reason.message);
     }
     if (results[1].status === "fulfilled") DATA.logs = results[1].value.logs || [];
     else problems.push("日志加载失败：" + results[1].reason.message);
-    if (results[2].status === "fulfilled") DATA.usage = results[2].value.usage;
+    if (results[2].status === "fulfilled") {
+      DATA.usage = results[2].value.usage;
+      (results[2].value.accountErrors || []).forEach(function (item) { problems.push(item.accountName + "：" + item.error); });
+    }
     else problems.push("配额加载失败：" + results[2].reason.message);
 
     render();
@@ -967,15 +1096,22 @@ function followUp(rounds) {
 /** 按 ID 找当前列表里的机器 */
 function findMachine(id) {
   for (var i = 0; i < DATA.machines.length; i++) {
-    if (DATA.machines[i].id === id) return DATA.machines[i];
+    if (DATA.machines[i].key === id) return DATA.machines[i];
   }
   return null;
+}
+
+function machinePath(key) {
+  var m = findMachine(key);
+  if (!m) throw new Error("机器已不在列表中，请刷新");
+  return "/accounts/" + encodeURIComponent(m.accountId) + "/machines/" + encodeURIComponent(m.id);
 }
 
 // ---------- 渲染 ----------
 function render() {
   var u = DATA.usage || {};
   var parts = [];
+  if (DATA.accountCount > 1) parts.push("账号 " + DATA.accountCount);
   if (u.machines != null) parts.push("机器 " + u.machines);
   if (u.snapshots != null) parts.push("快照 " + u.snapshots);
   if (u.storageGiB != null) parts.push("存储 " + u.storageGiB + " GB");
@@ -995,7 +1131,7 @@ function render() {
     list.innerHTML = DATA.logs.map(function (l) {
       return '<div class="log-item' + (l.ok ? "" : " fail") + '">' +
         '<span class="time">' + esc(fmtCN(l.t)) + '</span>' +
-        '<span class="who">' + esc(l.name || l.machineId) + '</span>' +
+        '<span class="who">' + esc((DATA.accountCount > 1 && l.accountName ? l.accountName + " · " : "") + (l.name || l.machineId)) + '</span>' +
         '<span class="what">' + esc(l.action) + ' · ' + esc(humanize(l.detail)) + '</span>' +
         '</div>';
     }).join("");
@@ -1005,23 +1141,29 @@ function render() {
 function renderCard(m) {
   var ka = m.keepalive || {};
   var on = ka.keepalive === "on";
-  var stateText = STATE_TEXT[m.state] || m.state;
-  var pillClass = STATE_PILL[m.state] || "busy";
+  var cooling = Date.parse(m.cooldownUntil) > Date.now();
+  var stateText = cooling ? "冷却中" : (STATE_TEXT[m.state] || m.state);
+  var pillClass = cooling ? "suspended" : (STATE_PILL[m.state] || "busy");
 
   // 保活状态：上次 / 下次保活时间 + 租约剩余
   var timeRows = "";
   if (ka.lastAt) {
-    timeRows += '<div class="time-row"><span>上次保活</span><b>' + esc(fmtCN(ka.lastAt)) + '</b></div>';
+    timeRows += '<div class="time-row"><span>上次检查</span><b>' + esc(fmtCN(ka.lastAt)) + '</b></div>';
+  }
+  if (cooling) {
+    timeRows += '<div class="time-row"><span>冷却结束</span><b>' + esc(fmtCN(m.cooldownUntil)) + '</b></div>';
   }
   if (on) {
-    timeRows += '<div class="time-row"><span>下次保活</span><b>' + esc(fmtCN(nextTickAt(ka.lastAt))) + '</b></div>';
+    timeRows += '<div class="time-row"><span>' + (cooling ? '预计重试' : '下次检查') + '</span><b>' + esc(fmtCN(nextTickAt(cooling ? m.cooldownUntil : null))) + '</b></div>';
   }
 
   var stateLine;
   var stateClass = "";
   if (on) {
-    stateLine = remainText(ka.leaseExpiresAt);
-    stateClass = " active";
+    if (cooling) stateLine = "冷却结束后自动重试";
+    else if (ka.lastStatus === "failed") { stateLine = ka.lastDetail || "上次保活失败"; stateClass = " failed"; }
+    else if (ka.lastStatus === "waiting") stateLine = ka.lastDetail;
+    else { stateLine = remainText(ka.leaseExpiresAt) || "等待检查"; stateClass = Date.parse(ka.leaseExpiresAt) > Date.now() ? " active" : ""; }
   } else if (ka.lastAt) {
     stateLine = "已关闭 · " + (ka.lastDetail || "");
   } else {
@@ -1029,7 +1171,7 @@ function renderCard(m) {
   }
 
   // 按当前状态给出可用操作；卡片被锁定时全部禁用
-  var locked = !!MACHINE_BUSY[m.id];
+  var locked = !!MACHINE_BUSY[m.key];
   var dis = locked ? " disabled" : "";
   var acts = [];
   if (m.state === "suspended") acts.push(["resume", "唤醒"]);
@@ -1037,9 +1179,11 @@ function renderCard(m) {
   if (m.state === "running") { acts.push(["suspend", "暂停"]); acts.push(["stop", "停止"]); }
 
   var btns = acts.map(function (a) {
-    return '<button class="btn" data-act="' + a[0] + '" data-id="' + esc(m.id) + '"' + dis + '>' + a[1] + '</button>';
+    var unavailable = !!m.operationId || (cooling && (a[0] === "start" || a[0] === "resume"));
+    return '<button class="btn" data-act="' + a[0] + '" data-id="' + esc(m.key) + '"' +
+      (unavailable ? ' disabled data-unavailable title="等待冷却或当前操作结束"' : dis) + '>' + a[1] + '</button>';
   }).join("");
-  btns += '<button class="btn danger" data-del="' + esc(m.id) + '" data-name="' + esc(m.name) + '"' + dis + '>删除</button>';
+  btns += '<button class="btn danger" data-del="' + esc(m.key) + '" data-name="' + esc(m.name) + '"' + dis + '>删除</button>';
 
   var spec = "";
   if (m.spec) {
@@ -1047,13 +1191,13 @@ function renderCard(m) {
       (m.spec.persistentDiskGiB ? " · " + m.spec.persistentDiskGiB + " GB 磁盘" : "");
   }
 
-  return '<div class="card' + (locked ? " locked" : "") + '" data-card="' + esc(m.id) + '">' +
+  return '<div class="card' + (locked ? " locked" : "") + '" data-card="' + esc(m.key) + '">' +
     '<div class="card-head">' +
       '<div class="card-head-top">' +
         '<div class="card-title">' + esc(m.name) + '</div>' +
         '<span class="pill ' + pillClass + '">' + esc(stateText) + '</span>' +
       '</div>' +
-      '<div class="card-meta"><span class="mono">' + esc(m.id) + '</span><br>' +
+      '<div class="card-meta">' + (DATA.accountCount > 1 ? esc(m.accountName) + '<br>' : '') + '<span class="mono">' + esc(m.id) + '</span><br>' +
       esc(spec) + (m.template ? " · " + esc(m.template) : "") + '</div>' +
     '</div>' +
     '<div class="actions">' + btns + '</div>' +
@@ -1064,7 +1208,7 @@ function renderCard(m) {
         timeRows +
         '<div class="state' + stateClass + '">' + esc(stateLine) + '</div>' +
       '</div>' +
-      '<button class="switch' + (on ? " on" : "") + '" data-toggle="' + esc(m.id) + '" aria-pressed="' + (on ? "true" : "false") + '" aria-label="自动保活"' + dis + '></button>' +
+      '<button class="switch' + (on ? " on" : "") + '" data-toggle="' + esc(m.key) + '" aria-pressed="' + (on ? "true" : "false") + '" aria-label="自动保活"' + dis + '></button>' +
     '</div>' +
   '</div>';
 }
@@ -1080,7 +1224,7 @@ function lifecycle(id, action, btn) {
     BUSY[key] = true;
     setMachineLocked(id, true);
     setBtnBusy(btn, true);
-    api("/machines/" + id + "/" + action, { method: "POST", body: JSON.stringify({ name: label }) })
+    api(machinePath(id) + "/" + action, { method: "POST", body: JSON.stringify({ name: label }) })
       .then(function () {
         // 先把本地状态切到过渡态，界面立刻有反馈，不必等下一次轮询
         var current = findMachine(id);
@@ -1105,7 +1249,7 @@ function lifecycle(id, action, btn) {
     confirmDialog({
       title: isStop ? "停止这台机器？" : "暂停这台机器？",
       message: isStop
-        ? "停止等于关机：内存和运行中的进程都会丢失，只有 /data 里的文件保留。下次启动是冷启动。"
+        ? "停止等于关机：内存和运行中的进程都会丢失，磁盘文件保留。下次启动是冷启动。"
         : "暂停会保留内存和运行中的进程，唤醒后从原地继续，不会冷启动。空闲 30 分钟也会自动暂停。",
       okText: isStop ? "停止" : "暂停",
       danger: isStop
@@ -1128,7 +1272,7 @@ function removeMachine(id, name, btn) {
     BUSY[key] = true;
     setMachineLocked(id, true);
     setBtnBusy(btn, true);
-    api("/machines/" + id, { method: "DELETE" })
+    api(machinePath(id), { method: "DELETE" })
       .then(function () {
         toast("已下发删除指令 · " + name);
         return followUp(3);
@@ -1154,7 +1298,7 @@ function toggleKa(id, enable, el) {
   var target = findMachine(id);
   var label = target ? target.name : id;
 
-  api("/machines/" + id + "/keepalive", {
+  api(machinePath(id) + "/keepalive", {
     method: "POST",
     body: JSON.stringify({ enable: enable, name: label })
   })
@@ -1226,6 +1370,11 @@ document.getElementById("clearLogsBtn").addEventListener("click", function (e) {
       .then(function () { setBtnBusy(btn, false); });
   });
 });
+
+// 只刷新已加载数据的时间显示，不额外访问 API。
+setInterval(function () {
+  if (AUTH && document.getElementById("mainView").style.display !== "none") render();
+}, 30000);
 
 // ---------- 启动 ----------
 if (AUTH) {
