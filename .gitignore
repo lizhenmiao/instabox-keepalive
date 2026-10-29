@@ -1,8 +1,7 @@
 # 本地开发文件，不纳入版本管理
-# 仓库只发布 worker.js 与 README
+# Worker 保持单文件部署；开发依赖不提交
 
 node_modules/
-package.json
 package-lock.json
 dev-server.mjs
 wrangler.toml
@@ -15,3 +14,4 @@ wrangler.toml
 .workbuddy-ai/
 preview.html
 *.log
+work/
